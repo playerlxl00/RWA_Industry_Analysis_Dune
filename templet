@@ -1,28 +1,28 @@
 -- 参数：{{pool_address}}, {{token_address}}
-WITH 
+WITH    //// WITH … AS ( … )：WITH 叫做公用表表达式（CTE），你可以理解成：先做两个临时小报表，取个名字，后面直接用。每个 CTE 内部是一个 SELECT 语句，结果是一张虚拟表，外面 SELECT 可以直接查它。
 -- 池子分析分支
 pool_analysis AS (
     SELECT
-        COUNT(*) AS trade_count,
+        COUNT(*) AS trade_count,                                                //// 在 SQL 里，COUNT(*) 是一个特殊聚合函数，* 不代表“所有列”，而是一个约定符号，意思是“计算结果集里一共有多少行”。无论行里的数据是 NULL 还是重复，每一行都算 1 次。举例：表里有 10 行，COUNT(*) 就返回 10。所以它统计的就是行数。因为这里 FROM dex.trades WHERE ... 筛选出了最近 1 小时这个池子的所有交易记录，每一行就是一笔交易，所以 COUNT(*) 自然就是交易笔数。我们给它取别名 trade_count。
         SUM(amount_usd) AS volume_usd,
-        COUNT(DISTINCT trader_a) AS unique_traders,
+        COUNT(DISTINCT trader_a) AS unique_traders,                             //// trader_a 是交易者的地址列。如果直接写 COUNT(trader_a)，它会计数所有非 NULL 的 trader_a，但不理会重复：同一个地址出现 5 次，就被计 5 次。加上 DISTINCT 关键字：COUNT(DISTINCT trader_a)，意思就是先对 trader_a 去重，只留下不重复的地址，再计数。这样，同一个地址无论交易多少次，最终只贡献 1。结果就是独立交易者数量。我们给它取名 unique_traders。所以去重是由 DISTINCT 完成的，COUNT 只是对去重后的集合计数。
         -- 你可以继续加：大额买入次数、平均滑点等
-        SUM(CASE WHEN amount_usd > 5000 THEN 1 ELSE 0 END) AS whale_trades
-    FROM dex.trades
-    WHERE contract_address = '{{pool_address}}'
-      AND blockchain = 'ethereum'
-      AND block_time > now() - interval '1' hour
+        SUM(CASE WHEN amount_usd > 5000 THEN 1 ELSE 0 END) AS whale_trades      //// 对 amount_usd 求和 → 起名 volume_usd（交易量，单位美元）。CASE WHEN ... THEN 1 ELSE 0 END 是条件表达式，满足条件计1，否则0。外层 SUM 把所有1加起来 → 起名 whale_trades（大户交易次数，单笔 > 5000 美元）
+    FROM dex.trades                                                             //// dex.trades 是 Dune 提供的去中心化交易所交易数据表，已经帮你整合好了 Uniswap、Sushi 等各 DEX 的交易记录。表名格式是 库名.表名，这里库名 dex，表名 trades。
+    WHERE contract_address = '{{pool_address}}'                                 //// 只查这个池子合约。Dune 的参数语法，执行查询时会弹出一个输入框，让你填地址，自动替换进去。'{{pool_address}}' 加单引号，因为它要作为字符串值放进 SQL。
+      AND blockchain = 'ethereum'                                               //// 只查以太坊链（Dune 很多表跨链，需要限定）。
+      AND block_time > now() - interval '1' hour                                //// 只要最近1小时的数据。
 ),
 -- 代币分析分支（大户+转账）
 token_analysis AS (
     SELECT
-        COUNT(*) AS transfer_count,
-        SUM(amount_usd) AS transfer_volume_usd,
-        COUNT(DISTINCT "from") AS active_senders,
+        COUNT(*) AS transfer_count, 
+        SUM(amount_usd) AS transfer_volume_usd,                                 //// 转账金额美元和
+        COUNT(DISTINCT "from") AS active_senders,                               //// 替换成一个参数 {{top20_balance}}，同时用 CAST 转成数字类型，确保后续如果需要计算不会出问题。这样你每次查询时，Dune 会弹出 top20_balance 的输入框，你直接把 Excel 里算好的前 20 大户总余额复制进去就行。
         CAST('{{top20_balance}}' AS double) AS top20_balance
-    FROM erc20_ethereum.evt_Transfer
-    WHERE contract_address = '{{token_address}}'
-      AND evt_block_time > now() - interval '1' hour
+    FROM erc20_ethereum.evt_Transfer                                            //// 这是 Dune 解析后的 ERC-20 转账事件表，每条记录都是一次转账。库名 erc20_ethereum，表名 evt_Transfer（注意大小写，一般 Dune 里是 evt_Transfer）。
+    WHERE contract_address = '{{token_address}}'                                //// 针对这个代币合约。
+      AND evt_block_time > now() - interval '1' hour                            //// 只要最近1小时的转账事件。
 )
 -- 合并输出
 SELECT
@@ -31,3 +31,56 @@ SELECT
     (SELECT whale_trades FROM pool_analysis) AS pool_whale_trades,
     (SELECT transfer_count FROM token_analysis) AS token_transfers,
     (SELECT top20_balance FROM token_analysis) AS token_top20_balance
+
+
+
+///////////////////////////////////////////////////
+你可以把整个查询想象成一个实时监控仪表盘背后的“数据抓取器”，专门盯着某一个交易池 + 它对应的代币，输出一份最近一小时的健康度快照。
+
+它到底产生了什么？
+最终结果只有一行，包含 5 个数字：
+
+列名	                    来源	                   业务含义
+pool_trades	                池子交易表	               最近 1 小时这个池子一共成交了多少笔
+pool_volume	                池子交易表	               最近 1 小时这个池子的总交易金额（美元）
+pool_whale_trades	        池子交易表	               其中单笔超过 5000 美元的大额交易有多少笔
+token_transfers	            代币转账表	               最近 1 小时这个代币总共发生了多少次转账
+token_top20_balance	        你手动提供的Excel 数据	   代币前 20 名地址的持币总和（你自己爬的）
+
+串起来的业务逻辑
+
+1. 池子活跃度：
+· pool_trades 告诉你交易多不多。
+· pool_volume 告诉你钱流动大不大。
+· pool_whale_trades 告诉你是否有大户在频繁出手（可能预示着价格异动）。
+
+2. 代币转移热度：
+
+· token_transfers 告诉你代币在链上移动的次数，配合 active_senders（代码里也有算，只是没输出）可以判断是散户在动还是项目方在转移。
+· 转账量 transfer_volume_usd 如果远大于池子交易量，可能说明有场外 OTC 或钱包整理。
+
+3. 筹码集中度（你提供的 top20 余额）：
+
+· 如果你看到交易量暴增，但 top20 持币比例过高，那可能是几个地址在对倒；
+· 如果 top20 余额在持续下降，可能是大户在派发。
+
+最终状态：你只要把三个参数填好，运行一次查询，就能得到一张“池子+代币”的即时状况卡，帮你判断这个币/池子目前是否健康、有没有异常动向。
+
+这就像一个飞机仪表盘：速度（交易量）、转速（笔数）、油温（大额交易）、乘客活动（转账）、行李舱载重（大户持仓），一眼看懂当前状态。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
