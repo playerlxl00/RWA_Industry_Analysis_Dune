@@ -1,0 +1,36 @@
+-- 参数：{{pool_address}}, {{token_address}}
+WITH 
+-- 池子分析分支
+pool_analysis AS (
+    SELECT
+        COUNT(*) AS trade_count,
+        SUM(amount_usd) AS volume_usd,
+        COUNT(DISTINCT trader_a) AS unique_traders,
+        -- 你可以继续加：大额买入次数、平均滑点等
+        SUM(CASE WHEN amount_usd > 5000 THEN 1 ELSE 0 END) AS whale_trades
+    FROM dex.trades
+    WHERE contract_address = '{{pool_address}}'
+      AND blockchain = 'ethereum'
+      AND block_time > now() - interval '1' hour
+),
+-- 代币分析分支（大户+转账）
+token_analysis AS (
+    SELECT
+        COUNT(*) AS transfer_count,
+        SUM(amount_usd) AS transfer_volume_usd,
+        COUNT(DISTINCT "from") AS active_senders,
+        -- 近似Top20占比（用快照表更准，这里仅为示例）
+        (SELECT SUM(amount) FROM balances_ethereum.erc20_latest 
+         WHERE token_address = '{{token_address}}' 
+         ORDER BY amount DESC LIMIT 20) AS top20_balance
+    FROM erc20_ethereum.evt_Transfer
+    WHERE contract_address = '{{token_address}}'
+      AND evt_block_time > now() - interval '1' hour
+)
+-- 合并输出
+SELECT
+    (SELECT trade_count FROM pool_analysis) AS pool_trades,
+    (SELECT volume_usd FROM pool_analysis) AS pool_volume,
+    (SELECT whale_trades FROM pool_analysis) AS pool_whale_trades,
+    (SELECT transfer_count FROM token_analysis) AS token_transfers,
+    (SELECT top20_balance FROM token_analysis) AS token_top20_balance
